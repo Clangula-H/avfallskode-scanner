@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="no">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Avfallskode-skanner</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 16px; background: #f4f6f8; }
+  h1 { font-size: 1.3rem; margin: 0 0 12px; }
+  button { width: 100%; padding: 14px; font-size: 1rem; border: none; border-radius: 8px; background: #1f6feb; color: #fff; margin-bottom: 10px; }
+  button.secondary { background: #5b6573; }
+  #video { width: 100%; border-radius: 8px; background: #000; display: none; }
+  input[type=text] { width: 100%; padding: 12px; font-size: 1rem; box-sizing: border-box; border: 1px solid #ccc; border-radius: 8px; margin-bottom: 10px; }
+  #result { background: #fff; border-radius: 8px; padding: 14px; margin-top: 12px; min-height: 40px; }
+  .code { font-size: 1.6rem; font-weight: bold; color: #1f6feb; }
+  .muted { color: #666; font-size: 0.9rem; }
+  #ocrPreview { max-width: 100%; border-radius: 8px; display: none; margin-bottom: 10px; }
+  #recent { margin-top: 12px; font-size: 0.9rem; }
+  #recent button { background: #fff; color: #1f6feb; border: 1px solid #1f6feb; padding: 10px; margin: 4px 0; }
+</style>
+</head>
+<body>
+<h1>Avfallskode-skanner</h1>
+
+<input type="file" id="csvFile" accept=".csv" />
+<button id="scanBtn">📷 Skann strekkode</button>
+<button id="ocrBtn" class="secondary">🔤 Les navn med kamera</button>
+<video id="video" autoplay playsinline></video>
+<img id="ocrPreview" alt="Bilde av etikett" />
+<input type="text" id="search" placeholder="Skriv produktnavn eller leverandør" />
+<button id="searchBtn">Søk</button>
+<div id="result" class="muted">Last inn CSV-filen først.</div>
+<div id="recent"></div>
+
+<script src="https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js"></script>
+<script src="https://unpkg.com/tesseract.js@5/dist/tesseract.min.js"></script>
+<script>
+let records = [];
+// Oppslagskart for rask tilgang (bygges når CSV lastes)
+let byBarcode = new Map();
+let byName = new Map();
+let recent = [];
+
+const video = document.getElementById('video');
+const ocrPreview = document.getElementById('ocrPreview');
+let reader = null;
+
+// Last inn CSV fra filvelgeren
+document.getElementById('csvFile').addEventListener('change', e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const fr = new FileReader();
+  fr.onload = () => {
+    records = parseCSV(fr.result);
+    buildIndex();
+    document.getElementById('result').textContent = `Lastet ${records.length} kjemikalier.`;
+  };
+  fr.readAsText(file, 'UTF-8');
+});
+
+// CSV-parser med støtte for anførselstegn (komma inni felt)
+// Forventer overskrifter: Product,Supplier,UNnumber,Wastenumber,GTIN
+function parseCSV(text) {
+  const rows = [];
+  let row = [];
+  let cell = '';
+  let inQuotes = false;
+  const src = text.replace(/^\uFEFF/, ''); // fjern BOM hvis Excel la den til
+
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (inQuotes) {
+      if (ch === '"' && src[i + 1] === '"') { cell += '"'; i++; }
+      else if (ch === '"') inQuotes = false;
+      else cell += ch;
+    } else {
+      if (ch === '"') inQuotes = true;
+      else if (ch === ',' || ch === ';') { row.push(cell.trim()); cell = ''; }
+      else if (ch === '\n') { row.push(cell.trim()); rows.push(row); row = []; cell = ''; }
+      else if (ch === '\r') { /* hoppes over */ }
+      else cell += ch;
+    }
+  }
+  if (cell.length || row.length) { row.push(cell.trim()); rows.push(row); }
+
+  const nonEmpty = rows.filter(r => r.some(c => c !== ''));
+  if (!nonEmpty.length) return [];
+  const headers = nonEmpty[0].map(h => h.trim());
+  return nonEmpty.slice(1).map(cells => {
+    const obj = {};
+    headers.forEach((h, i) => obj[h] = (cells[i] || '').trim());
+    return obj;
+  });
+}
+
+// Normaliser tekst for sammenligning (små bokstaver, fjern tegnsetting og ekstra mellomrom)
+function normalize(s) {
+  return String(s || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9æøå]+/g, ' ')
+    .trim();
+}
+
+// Bygg oppslagskart én gang for rask søking
+function buildIndex() {
+  byBarcode = new Map();
+  byName = new Map();
+  for (const r of records) {
+    const gtin = (r.GTIN || '').replace(/\s/g, '');
+    if (gtin) byBarcode.set(gtin, r);
+    const key = normalize(r.Product);
+    if (key) byName.set(key, r);
+  }
+}
+
+// Vis treff. Felt: Product, Supplier, UNnumber, Wastenumber, GTIN
+function showMatch(items) {
+  const box = document.getElementById('result');
+  if (!items.length) {
+    box.innerHTML = '<span class="muted">Ingen treff. Prøv et annet navn eller skann på nytt.</span>';
+    return;
+  }
+  box.innerHTML = items.map(r => `
+    <div style="margin-bottom:10px">
+      <div><strong>${escapeHtml(r.Product)}</strong> <span class="muted">${escapeHtml(r.Supplier || '')}</span></div>
+      <div class="muted">UN-nummer: ${escapeHtml(r.UNnumber || '–')} · GTIN: ${escapeHtml(r.GTIN || '–')}</div>
+      <div class="code">${escapeHtml(r.Wastenumber || '–')}</div>
+    </div>`).join('<hr>');
+  if (items.length === 1) addRecent(items[0]);
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// Sist brukte kjemikalier (hurtig gjenbruk)
+function addRecent(r) {
+  recent = recent.filter(x => x.Product !== r.Product);
+  recent.unshift(r);
+  recent = recent.slice(0, 5);
+  renderRecent();
+}
+
+function renderRecent() {
+  const box = document.getElementById('recent');
+  if (!recent.length) { box.innerHTML = ''; return; }
+  box.innerHTML = '<div class="muted">Sist brukt:</div>' + recent.map((r, i) =>
+    `<button data-i="${i}">${escapeHtml(r.Product)} → ${escapeHtml(r.Wastenumber || '–')}</button>`
+  ).join('');
+  box.querySelectorAll('button').forEach(b =>
+    b.addEventListener('click', () => showMatch([recent[+b.dataset.i]]))
+  );
+}
+
+// Tekstsøk på produktnavn eller leverandør
+function searchText(q) {
+  const n = normalize(q);
+  if (!n) return [];
+  // Eksakt treff først via kartet
+  if (byName.has(n)) return [byName.get(n)];
+  // Ellers delvis treff
+  return records.filter(r =>
+    normalize(r.Product).includes(n) ||
+    normalize(r.Supplier).includes(n)
+  );
+}
+
+document.getElementById('searchBtn').addEventListener('click', () => {
+  showMatch(searchText(document.getElementById('search').value));
+});
+
+// Strekkodeskanning med ZXing (søker i GTIN-kolonnen)
+document.getElementById('scanBtn').addEventListener('click', async () => {
+  video.style.display = 'block';
+  reader = new ZXing.BrowserMultiFormatReader();
+  try {
+    await reader.decodeFromVideoDevice(undefined, video, (result, err) => {
+      if (result) {
+        const code = result.getText().trim();
+        const hit = byBarcode.get(code);
+        showMatch(hit ? [hit] : []);
+        stopScan();
+      }
+    });
+  } catch (e) {
+    document.getElementById('result').textContent = 'Kamera ikke tilgjengelig: ' + e;
+  }
+});
+
+// Les produktnavn fra etiketten med kamera (OCR)
+document.getElementById('ocrBtn').addEventListener('click', () => {
+  if (!records.length) {
+    document.getElementById('result').textContent = 'Last inn CSV-filen først.';
+    return;
+  }
+  // Bruk kameraets bildeopptak direkte på mobil
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'image/*';
+  input.capture = 'environment';
+  input.addEventListener('change', async () => {
+    const file = input.files[0];
+    if (!file) return;
+    ocrPreview.src = URL.createObjectURL(file);
+    ocrPreview.style.display = 'block';
+    document.getElementById('result').textContent = 'Leser etiketten…';
+    try {
+      const { data } = await Tesseract.recognize(file, 'nor+eng');
+      const lines = data.text.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 2);
+      // Prøv hver linje mot Excel-arket, og velg beste treff
+      let best = [];
+      for (const line of lines) {
+        const hits = searchText(line);
+        if (hits.length && (best.length === 0 || hits.length < best.length)) best = hits;
+      }
+      if (!best.length) {
+        // Fallback: søk på hele teksten
+        best = searchText(data.text);
+      }
+      showMatch(best);
+      if (!best.length) {
+        document.getElementById('result').innerHTML +=
+          '<div class="muted">Fant ikke navnet. Ta et nytt bilde nærmere etiketten, eller skriv navnet.</div>';
+      }
+    } catch (e) {
+      document.getElementById('result').textContent = 'Kunne ikke lese bildet: ' + e;
+    }
+  });
+  input.click();
+});
+
+function stopScan() {
+  if (reader) reader.reset();
+  video.style.display = 'none';
+}
+</script>
+</body>
+</html>
